@@ -17,6 +17,7 @@
 #include "media/gpu/chromeos/fourcc.h"
 #include "media/gpu/gpu_video_decode_accelerator_helpers.h"
 #include "media/gpu/macros.h"
+#include "media/gpu/v4l2/v4l2_video_decoder_backend_stateful.h"
 #include "media/gpu/v4l2/v4l2_video_decoder_backend_stateless.h"
 
 namespace media {
@@ -93,7 +94,7 @@ V4L2SliceVideoDecoder::~V4L2SliceVideoDecoder() {
   }
 
   // Stop and Destroy device.
-  StopStreamV4L2Queue();
+  StopStreamV4L2Queue(true);
   if (input_queue_) {
     input_queue_->DeallocateBuffers();
     input_queue_ = nullptr;
@@ -116,7 +117,7 @@ void V4L2SliceVideoDecoder::Initialize(const VideoDecoderConfig& config,
 
   // Reset V4L2 device and queue if reinitializing decoder.
   if (state_ != State::kUninitialized) {
-    if (!StopStreamV4L2Queue()) {
+    if (!StopStreamV4L2Queue(true)) {
       std::move(init_cb).Run(StatusCode::kV4l2FailedToStopStreamQueue);
       return;
     }
@@ -141,12 +142,33 @@ void V4L2SliceVideoDecoder::Initialize(const VideoDecoderConfig& config,
 
   // Open V4L2 device.
   VideoCodecProfile profile = config.profile();
-  uint32_t input_format_fourcc =
+  uint32_t input_format_fourcc_stateless =
       V4L2Device::VideoCodecProfileToV4L2PixFmt(profile, true);
-  if (!input_format_fourcc ||
-      !device_->Open(V4L2Device::Type::kDecoder, input_format_fourcc)) {
+  if (!input_format_fourcc_stateless ||
+      !device_->Open(V4L2Device::Type::kDecoder,
+                     input_format_fourcc_stateless)) {
     VLOGF(1) << "Failed to open device for profile: " << profile
-             << " fourcc: " << FourccToString(input_format_fourcc);
+             << " fourcc: " << FourccToString(input_format_fourcc_stateless);
+    input_format_fourcc_stateless = 0;
+  } else {
+    VLOGF(1) << "Found V4L2 device capable of stateless decoding for "
+             << FourccToString(input_format_fourcc_stateless);
+  }
+
+  uint32_t input_format_fourcc_stateful =
+      V4L2Device::VideoCodecProfileToV4L2PixFmt(profile, false);
+  if (!input_format_fourcc_stateful ||
+      !device_->Open(V4L2Device::Type::kDecoder,
+                     input_format_fourcc_stateful)) {
+    VLOGF(1) << "Failed to open device for profile: " << profile
+             << " fourcc: " << FourccToString(input_format_fourcc_stateful);
+    input_format_fourcc_stateful = 0;
+  } else {
+    VLOGF(1) << "Found V4L2 device capable of stateful decoding for "
+             << FourccToString(input_format_fourcc_stateful);
+  }
+
+  if (!input_format_fourcc_stateless && !input_format_fourcc_stateful) {
     std::move(init_cb).Run(StatusCode::kV4l2NoDecoder);
     return;
   }
@@ -172,10 +194,26 @@ void V4L2SliceVideoDecoder::Initialize(const VideoDecoderConfig& config,
     return;
   }
 
+  uint32_t input_format_fourcc;
   // Create the backend (only stateless API supported as of now).
-  backend_ = std::make_unique<V4L2StatelessVideoDecoderBackend>(
-      this, device_, profile, decoder_task_runner_);
-  if (!backend_->Initialize()) {
+  if (input_format_fourcc_stateless) {
+    backend_ = std::make_unique<V4L2StatelessVideoDecoderBackend>(
+        this, device_, profile, decoder_task_runner_);
+    if (!backend_->Initialize()) {
+      std::move(init_cb).Run(StatusCode::kV4l2FailedResourceAllocation);
+      return;
+    }
+    input_format_fourcc = input_format_fourcc_stateless;
+  } else if (input_format_fourcc_stateful) {
+    backend_ = std::make_unique<V4L2StatefulVideoDecoderBackend>(
+        this, device_, profile, decoder_task_runner_);
+    if (!backend_->Initialize()) {
+      std::move(init_cb).Run(StatusCode::kV4l2FailedResourceAllocation);
+      return;
+    }
+    input_format_fourcc = input_format_fourcc_stateful;
+  } else {
+    VLOGF(1) << "No backend capable of taking this profile.";
     std::move(init_cb).Run(StatusCode::kV4l2FailedResourceAllocation);
     return;
   }
@@ -190,6 +228,13 @@ void V4L2SliceVideoDecoder::Initialize(const VideoDecoderConfig& config,
   if (input_queue_->AllocateBuffers(kNumInputBuffers, V4L2_MEMORY_MMAP) == 0) {
     VLOGF(1) << "Failed to allocate input buffer.";
     std::move(init_cb).Run(StatusCode::kV4l2FailedResourceAllocation);
+    return;
+  }
+
+  // Start streaming input queue and polling.
+  if (!StartStreamV4L2Queue(false)) {
+    VLOGF(1) << "Failed to start streaming.";
+    std::move(init_cb).Run(StatusCode::kV4L2FailedToStartStreamQueue);
     return;
   }
 
@@ -249,6 +294,8 @@ bool V4L2SliceVideoDecoder::SetupOutputFormat(const gfx::Size& size,
       continue;
     }
 
+    // See if the format is supported at the desired resolution
+    // TODO change this to TrySetFormat!!
     base::Optional<struct v4l2_format> format =
         output_queue_->SetFormat(pixfmt, size, 0);
     if (!format)
@@ -321,12 +368,13 @@ void V4L2SliceVideoDecoder::Reset(base::OnceClosure closure) {
   // Streamoff V4L2 queues to drop input and output buffers.
   // If the queues are streaming before reset, then we need to start streaming
   // them after stopping.
-  bool is_streaming = input_queue_->IsStreaming();
-  if (!StopStreamV4L2Queue())
+  const bool is_streaming = input_queue_->IsStreaming();
+  const bool is_output_streaming = output_queue_->IsStreaming();
+  if (!StopStreamV4L2Queue(true))
     return;
 
   if (is_streaming) {
-    if (!StartStreamV4L2Queue())
+    if (!StartStreamV4L2Queue(is_output_streaming))
       return;
   }
 
@@ -352,11 +400,12 @@ void V4L2SliceVideoDecoder::Decode(scoped_refptr<DecoderBuffer> buffer,
                               bitstream_id);
 }
 
-bool V4L2SliceVideoDecoder::StartStreamV4L2Queue() {
+bool V4L2SliceVideoDecoder::StartStreamV4L2Queue(bool start_output_queue) {
   DCHECK_CALLED_ON_VALID_SEQUENCE(decoder_sequence_checker_);
   DVLOGF(3);
 
-  if (!input_queue_->Streamon() || !output_queue_->Streamon()) {
+  if (!input_queue_->Streamon() ||
+      (start_output_queue && !output_queue_->Streamon())) {
     VLOGF(1) << "Failed to streamon V4L2 queue.";
     SetState(State::kError);
     return false;
@@ -374,7 +423,7 @@ bool V4L2SliceVideoDecoder::StartStreamV4L2Queue() {
   return true;
 }
 
-bool V4L2SliceVideoDecoder::StopStreamV4L2Queue() {
+bool V4L2SliceVideoDecoder::StopStreamV4L2Queue(bool stop_input_queue) {
   DCHECK_CALLED_ON_VALID_SEQUENCE(decoder_sequence_checker_);
   DVLOGF(3);
 
@@ -384,7 +433,7 @@ bool V4L2SliceVideoDecoder::StopStreamV4L2Queue() {
   }
 
   // Streamoff input and output queue.
-  if (input_queue_)
+  if (input_queue_ && stop_input_queue)
     input_queue_->Streamoff();
   if (output_queue_)
     output_queue_->Streamoff();
@@ -439,7 +488,6 @@ void V4L2SliceVideoDecoder::ContinueChangeResolution(
     const size_t num_output_frames) {
   DCHECK_CALLED_ON_VALID_SEQUENCE(decoder_sequence_checker_);
   DVLOGF(3);
-  DCHECK_EQ(input_queue_->QueuedBuffersCount(), 0u);
   DCHECK_EQ(output_queue_->QueuedBuffersCount(), 0u);
 
   // If we already reset, then skip it.
@@ -455,7 +503,10 @@ void V4L2SliceVideoDecoder::ContinueChangeResolution(
 
   num_output_frames_ = num_output_frames;
 
-  if (!StopStreamV4L2Queue())
+  // TODO: update V4L2 stateless spec to only stop CAPTURE queue on resolution
+  // change! Nope! Since we set the resolution on the OUTPUT queue for stateless
+  // we need to stop it as well!
+  if (!StopStreamV4L2Queue(false))
     return;
 
   if (!output_queue_->DeallocateBuffers()) {
@@ -488,7 +539,7 @@ void V4L2SliceVideoDecoder::ContinueChangeResolution(
     return;
   }
 
-  if (!StartStreamV4L2Queue()) {
+  if (!StartStreamV4L2Queue(true)) {
     SetState(State::kError);
     return;
   }
@@ -500,7 +551,7 @@ void V4L2SliceVideoDecoder::ContinueChangeResolution(
                      base::Unretained(backend_.get()), true));
 }
 
-void V4L2SliceVideoDecoder::ServiceDeviceTask(bool /* event */) {
+void V4L2SliceVideoDecoder::ServiceDeviceTask(bool event) {
   DCHECK_CALLED_ON_VALID_SEQUENCE(decoder_sequence_checker_);
   DVLOGF(3) << "Number of queued input buffers: "
             << input_queue_->QueuedBuffersCount()
@@ -509,8 +560,9 @@ void V4L2SliceVideoDecoder::ServiceDeviceTask(bool /* event */) {
 
   // Dequeue V4L2 output buffer first to reduce output latency.
   bool success;
-  V4L2ReadableBufferRef dequeued_buffer;
   while (output_queue_->QueuedBuffersCount() > 0) {
+    V4L2ReadableBufferRef dequeued_buffer;
+
     std::tie(success, dequeued_buffer) = output_queue_->DequeueBuffer();
     if (!success) {
       SetState(State::kError);
@@ -524,6 +576,8 @@ void V4L2SliceVideoDecoder::ServiceDeviceTask(bool /* event */) {
 
   // Dequeue V4L2 input buffer.
   while (input_queue_->QueuedBuffersCount() > 0) {
+    V4L2ReadableBufferRef dequeued_buffer;
+
     std::tie(success, dequeued_buffer) = input_queue_->DequeueBuffer();
     if (!success) {
       SetState(State::kError);
@@ -532,6 +586,8 @@ void V4L2SliceVideoDecoder::ServiceDeviceTask(bool /* event */) {
     if (!dequeued_buffer)
       break;
   }
+
+  backend_->OnServiceDeviceTask(event);
 }
 
 void V4L2SliceVideoDecoder::OutputFrame(scoped_refptr<VideoFrame> frame,

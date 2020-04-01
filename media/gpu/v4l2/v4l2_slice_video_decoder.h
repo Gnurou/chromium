@@ -118,10 +118,10 @@ class MEDIA_GPU_EXPORT V4L2SliceVideoDecoder
 
   // Start streaming V4L2 input and output queues. Attempt to start
   // |device_poll_thread_| before starting streaming.
-  bool StartStreamV4L2Queue();
+  bool StartStreamV4L2Queue(bool start_output_queue);
   // Stop streaming V4L2 input and output queues. Stop |device_poll_thread_|
   // before stopping streaming.
-  bool StopStreamV4L2Queue();
+  bool StopStreamV4L2Queue(bool stop_input_queue);
   // Try to dequeue input and output buffers from device.
   void ServiceDeviceTask(bool event);
 

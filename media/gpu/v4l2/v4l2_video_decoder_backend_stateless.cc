@@ -498,6 +498,8 @@ void V4L2StatelessVideoDecoderBackend::PumpOutputSurfaces() {
   }
 
   if (resume_decode) {
+    // TODO why aren't we sending CMD_FLUSH anywhere?
+    // It should be used for draining and resolution change.
     client_->CompleteFlush();
     task_runner_->PostTask(
         FROM_HERE,
